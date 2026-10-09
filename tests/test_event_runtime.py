@@ -507,50 +507,51 @@ def test_open_db_rebuilds_missing_catalog_fts_rows():
         migrated.close()
 
 
-def test_private_real_preflight_rejects_sha_mismatch(tmp_path):
-    from data.build_private_real_db import build_private_real_db
-    from data.generation_profiles import load_default_generation_params
-    from data.private_real_preflight import preflight_dataset
-    from tests.private_real_fixture import write_fixture_csv
+def _write_catalog_fixture(tmp_path, rows=10):
+    """Write arbitrary synthetic Products directly to the loader's SQLite format."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_path / "catalog.sqlite"
+    products = []
+    for index in range(rows):
+        product = vars(_mkproduct(product_id=f"TEST{index:03d}")).copy()
+        product["market_curve"] = json.dumps(product["market_curve"])
+        products.append(product)
+    columns = list(products[0])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE dataset_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.executemany(
+            "INSERT INTO dataset_meta VALUES (?, ?)",
+            [("dataset_rows", str(rows)), ("dataset_sha256", "fixture-only")],
+        )
+        conn.execute(f"CREATE TABLE products({','.join(columns)})")
+        conn.executemany(
+            f"INSERT INTO products VALUES ({','.join('?' for _ in columns)})",
+            [tuple(product[column] for column in columns) for product in products],
+        )
+        conn.execute("CREATE TABLE hourly_dist(category TEXT, hour INTEGER, w REAL)")
+        conn.executemany(
+            "INSERT INTO hourly_dist VALUES (?, ?, ?)",
+            [("office", hour, 1.0 / 24.0) for hour in range(24)],
+        )
+    return db_path
 
-    bench_path = write_fixture_csv(str(tmp_path))
-    db_path = tmp_path / "private_real.sqlite"
-    params = load_default_generation_params()
-    params["supplier_item_count"] = dict(params.get("supplier_item_count", {}))
-    params["supplier_item_count"]["min"] = 1
-    build_private_real_db(
-        bench_csv=bench_path,
-        output_db=str(db_path),
-        target_rows=10,
-        seed=7,
-        params=params,
-    )
+
+def test_private_real_preflight_rejects_sha_mismatch(tmp_path):
+    from data import private_real
+    from data.private_real_preflight import preflight_dataset
+
+    db_path = _write_catalog_fixture(tmp_path)
+    assert preflight_dataset(str(db_path))["ok"] is True
+    products, hourly_dist, meta = private_real.load_dataset(str(db_path))
+    assert len(products) == 10
+    assert products[0] == _mkproduct(product_id="TEST000")
+    assert len(hourly_dist["office"]) == 24
+    assert meta["dataset_rows"] == "10"
 
     result = preflight_dataset(str(db_path), expected_sha="definitely-wrong")
 
     assert result["ok"] is False
     assert "dataset_sha256" in result["errors"][0]
-
-
-def _build_private_real_fixture(tmp_path, rows=10):
-    from data.build_private_real_db import build_private_real_db
-    from data.generation_profiles import load_default_generation_params
-    from tests.private_real_fixture import write_fixture_csv
-
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    bench_path = write_fixture_csv(str(tmp_path))
-    db_path = tmp_path / f"private_real_{rows}.sqlite"
-    params = load_default_generation_params()
-    params["supplier_item_count"] = dict(params.get("supplier_item_count", {}))
-    params["supplier_item_count"]["min"] = 1
-    build_private_real_db(
-        bench_csv=bench_path,
-        output_db=str(db_path),
-        target_rows=rows,
-        seed=7,
-        params=params,
-    )
-    return db_path
 
 
 def test_private_real_preflight_rejects_unreadable_and_missing_tables(tmp_path):
@@ -575,7 +576,7 @@ def test_private_real_preflight_rejects_unreadable_and_missing_tables(tmp_path):
 def test_private_real_preflight_rejects_market_curve_and_hourly_dist_drift(tmp_path):
     from data.private_real_preflight import preflight_dataset
 
-    db_path = _build_private_real_fixture(tmp_path)
+    db_path = _write_catalog_fixture(tmp_path)
     conn = sqlite3.connect(db_path)
     conn.execute(
         "UPDATE products SET market_curve=? WHERE product_id=(SELECT product_id FROM products LIMIT 1)",
@@ -587,7 +588,7 @@ def test_private_real_preflight_rejects_market_curve_and_hourly_dist_drift(tmp_p
     assert curve_result["ok"] is False
     assert any("market_curve length" in err for err in curve_result["errors"])
 
-    db_path = _build_private_real_fixture(tmp_path / "hourly")
+    db_path = _write_catalog_fixture(tmp_path / "hourly")
     conn = sqlite3.connect(db_path)
     conn.execute(
         "UPDATE hourly_dist SET w=0.0"
@@ -603,7 +604,7 @@ def test_private_real_preflight_rejects_market_curve_and_hourly_dist_drift(tmp_p
 def test_private_real_preflight_rejects_supplier_profile_drift(tmp_path):
     from data.private_real_preflight import preflight_dataset
 
-    db_path = _build_private_real_fixture(tmp_path)
+    db_path = _write_catalog_fixture(tmp_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cols = [row["name"] for row in conn.execute("PRAGMA table_info(products)").fetchall()]
